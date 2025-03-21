@@ -1,9 +1,8 @@
-fastapi
-uvicorn
-pydantic
-python-multipart
-requests
-PyMuPDF
-scikit-learn
-numpy
-scipy
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.9.2
+PyMuPDF==1.24.10
+requests==2.32.3
+scikit-learn==1.5.2
+textblob==0.18.0.post0
+textstat==0.7.4
