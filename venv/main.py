@@ -1,7 +1,8 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException, File
+from fastapi import FastAPI, UploadFile, Form, HTTPException, File, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import fitz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -11,6 +12,15 @@ import textstat
 import nltk
 from nltk.corpus import stopwords
 import logging
+import json
+import requests
+from starlette_session import SessionMiddleware
+from datetime import timedelta
+import uuid
+import time
+
+
+SESSION_DATA = {} 
 
 nltk.download('stopwords')
 nltk.download('punkt')
@@ -23,13 +33,31 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# Define your Pydantic model
+class AnswerSubmission(BaseModel):
+    answer: Optional[str] = ""
+    audio: Optional[str] = None
+    transcription: Optional[str] = ""
+    question: Optional[dict] = None
+    frames: Optional[List[str]] = []
+
+# Add session middleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key="a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+    cookie_name="session",
+    max_age=86400
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Groq API Key
+GROQ_API_KEY = "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"
 
 class ATSResponse(BaseModel):
     ats_score: float
@@ -47,6 +75,14 @@ class ATSResponse(BaseModel):
     analysis: str
     suggestions: List[str]
     keywords: List[str]
+    resume_text: str
+
+class AnswerSubmission(BaseModel):
+    audio: Optional[str] = None
+    transcription: Optional[str] = None
+    answer: Optional[str] = None
+    frames: Optional[List[str]] = None
+    question: Optional[str] = None
 
 def extract_text_from_pdf(file):
     try:
@@ -264,9 +300,365 @@ def generate_suggestions(resume_text, job_desc, metrics):
         suggestions.append("Shorten sentences and vary word choice.")
     
     return suggestions if suggestions else ["Resume is solid; refine for perfection."]
+def generate_interview_questions(resume_text: str, jd_text: str = "") -> List[Dict]:
+    """Generate personalized questions based on resume text using Groq LLM"""
+    # Truncate resume and JD text to reduce token usage
+    max_resume_length = 2000
+    max_jd_length = 1000
+    
+    if len(resume_text) > max_resume_length:
+        resume_text = resume_text[:max_resume_length] + "... [truncated]"
+    
+    if jd_text and len(jd_text) > max_jd_length:
+        jd_text = jd_text[:max_jd_length] + "... [truncated]"
+    
+    prompt = ""
+    if jd_text:
+        prompt = f"""
+        Generate 5 interview questions based on this resume and job description:
+        
+        RESUME EXCERPT:
+        {resume_text}
+        
+        JOB DESCRIPTION EXCERPT:
+        {jd_text}
+        
+        Rules:
+        1. If resume has projects/internships, create questions based on them
+        2. If no projects/internships, focus on technical skills and job description
+        3. First 3 questions: moderate difficulty
+        4. Last 2 questions: hard difficulty
+        5. At least 2 questions should be technical based on resume skills
+        
+        Format as JSON array with fields: question, difficulty, category, expected_answer
+        """
+    else:
+        prompt = f"""
+        Based on the following resume, create 5 interview questions:
+        - 2 project-based questions
+        - 2 internship-based questions
+        - 1 technical skill question
+        
+        Among these, 2 questions should be challenging. Format the response as a JSON array with 
+        objects containing 'question', 'type' (project/internship/technical), 'difficulty' (easy/hard), and 'expected_answer' field.
+        
+        Resume: {resume_text}
+        """
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are an expert technical interviewer. You always respond with well-formatted JSON arrays containing question objects."},
+                {"role": "user", "content": prompt}
+            ],
+            "model": "llama3-70b-8192",
+            "temperature": 0.7,
+            "max_tokens": 2000,
+            "top_p": 1,
+            "stream": False,
+            "stop": None
+        }
+        
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            try:
+                questions = json.loads(content)
+                if len(questions) < 5:
+                    logger.warning(f"Only got {len(questions)} questions, adding generic ones")
+                    generic_questions = generate_fallback_questions(resume_text)
+                    questions.extend(generic_questions[len(questions):5])
+                return questions
+            except json.JSONDecodeError:
+                logger.error("Failed to parse JSON directly, trying to extract JSON")
+                json_match = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
+                if json_match:
+                    questions = json.loads(json_match.group(0))
+                    if len(questions) < 5:
+                        generic_questions = generate_fallback_questions(resume_text)
+                        questions.extend(generic_questions[len(questions):5])
+                    return questions
+                else:
+                    logger.error("No JSON structure found in response")
+                    return generate_fallback_questions(resume_text)
+        else:
+            logger.error(f"Error generating questions: {response.status_code}, {response.text}")
+            return generate_fallback_questions(resume_text)
+    except Exception as e:
+        logger.error(f"Error generating questions: {e}")
+        return generate_fallback_questions(resume_text)
+
+def generate_fallback_questions(resume_text: str) -> List[Dict]:
+    """Generate fallback questions when the API call fails"""
+    skills = []
+    resume_lower = resume_text.lower()
+    common_skills = ["python", "javascript", "java", "c++", "react", "node.js", "sql", 
+                    "machine learning", "data analysis", "cloud", "aws", "azure", 
+                    "docker", "kubernetes", "agile", "scrum", "project management"]
+    
+    for skill in common_skills:
+        if skill in resume_lower:
+            skills.append(skill)
+    
+    if not skills:
+        skills = ["programming", "problem solving", "teamwork"]
+    
+    questions = [
+        {
+            "question": f"Can you explain your experience with {skills[0] if skills else 'your technical skills'}?",
+            "difficulty": "Moderate",
+            "category": "Technical",
+            "expected_answer": f"Looking for detailed explanation of {skills[0] if skills else 'technical skills'} with examples"
+        },
+        {
+            "question": "Describe a challenging project you worked on and how you overcame obstacles.",
+            "difficulty": "Moderate",
+            "category": "Project-based",
+            "expected_answer": "Should mention specific project, challenges faced, and solutions implemented"
+        },
+        {
+            "question": f"How do you stay updated with the latest developments in {skills[1] if len(skills) > 1 else 'your field'}?",
+            "difficulty": "Moderate",
+            "category": "General",
+            "expected_answer": "Looking for specific learning resources, communities, or practices"
+        },
+        {
+            "question": f"Explain a complex concept in {skills[0] if skills else 'your field'} as if you were teaching it to a beginner.",
+            "difficulty": "Hard",
+            "category": "Technical",
+            "expected_answer": "Should break down complex topic clearly and accurately"
+        },
+        {
+            "question": "If you were given a task with unclear requirements, how would you approach it?",
+            "difficulty": "Hard",
+            "category": "General",
+            "expected_answer": "Looking for problem-solving approach, communication skills, and initiative"
+        }
+    ]
+    
+    return questions
+
+def evaluate_answer(question, resume_text, answer):
+    """Evaluate user's answer using LLM"""
+    try:
+        # Check if question is a string or a dict
+        question_text = question
+        question_info = {"difficulty": "Unknown", "category": "Unknown", "expected_answer": "Unknown"}
+        
+        if isinstance(question, dict):
+            question_text = question.get('question', '')
+            question_info = {
+                "difficulty": question.get('difficulty', 'Unknown'),
+                "category": question.get('category', 'Unknown') if 'category' in question else question.get('type', 'Unknown'),
+                "expected_answer": question.get('expected_answer', 'Unknown')
+            }
+        
+        # Debug logs
+        print("Question: ", question_text[:100])
+        print("Question type: ", type(question))
+        print("Answer length: ", len(answer))
+        
+        prompt = f"""
+        You are a technical interviewer. Evaluate this answer based on accuracy, completeness, and clarity.
+        
+        Question: {question_text}
+        Question Difficulty: {question_info['difficulty']}
+        Question Category: {question_info['category']}
+        Expected Answer Points: {question_info['expected_answer']}
+        Resume Information: {resume_text[:500] if resume_text else ''}... [truncated]
+        Answer: {answer}
+        
+        Evaluate the answer on a scale of 0-100 based on:
+        - Technical accuracy (70%)
+        - Clarity and coherence (20%)
+        - Grammar, fluency, and confidence (10%)
+        
+        Provide a score out of 100 and detailed feedback including strengths and areas for improvement.
+        Format your response as a JSON object with 'score' (number) and 'feedback' (string) keys.
+        
+        EXAMPLE RESPONSE FORMAT:
+        {{"score": 85, "feedback": "Your answer was comprehensive and technically accurate..."}}
+        """
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are an expert technical interviewer who evaluates answers objectively. You always respond with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "model": "llama3-70b-8192",
+            "temperature": 0.3,
+            "max_tokens": 1000
+        }
+        
+        print("Sending evaluation request to API...")
+        
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        print(f"API response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            print(f"Raw API content: {content[:100]}...")
+            
+            try:
+                # Try to parse the entire content as JSON
+                evaluation = json.loads(content)
+                print("Successfully parsed JSON response")
+                
+                # Validate the evaluation object has the required fields
+                if 'score' not in evaluation or 'feedback' not in evaluation:
+                    print("Missing required fields in evaluation")
+                    # Create proper structure if missing
+                    score = evaluation.get('score', 50)
+                    feedback = evaluation.get('feedback', 'No detailed feedback available')
+                    evaluation = {'score': int(score), 'feedback': feedback}
+                
+                # Ensure score is an integer
+                if not isinstance(evaluation['score'], int):
+                    try:
+                        evaluation['score'] = int(float(evaluation['score']))
+                    except (ValueError, TypeError):
+                        evaluation['score'] = 50
+                        
+                print(f"Final evaluation: score={evaluation['score']}, feedback={evaluation['feedback'][:50]}...")
+                return evaluation
+            except json.JSONDecodeError as e:
+                print(f"JSON decode error: {e}")
+                # If that fails, try to extract JSON from the text
+                import re
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    try:
+                        json_str = json_match.group(0)
+                        print(f"Extracted JSON string: {json_str[:100]}...")
+                        evaluation = json.loads(json_str)
+                        
+                        # Validate the evaluation object has the required fields
+                        if 'score' not in evaluation or 'feedback' not in evaluation:
+                            score = evaluation.get('score', 50)
+                            feedback = evaluation.get('feedback', 'No detailed feedback available')
+                            evaluation = {'score': int(score), 'feedback': feedback}
+                        
+                        # Ensure score is an integer
+                        if not isinstance(evaluation['score'], int):
+                            try:
+                                evaluation['score'] = int(float(evaluation['score']))
+                            except (ValueError, TypeError):
+                                evaluation['score'] = 50
+                                
+                        print(f"Extracted evaluation: score={evaluation['score']}, feedback={evaluation['feedback'][:50]}...")
+                        return evaluation
+                    except Exception as e:
+                        print(f"Error parsing extracted JSON: {e}")
+                        # Parse failure, use fallback with text extraction
+                        
+                        # Try to extract score using regex
+                        score_match = re.search(r'score["\s:]+(\d+)', content, re.IGNORECASE)
+                        score = int(score_match.group(1)) if score_match else 50
+                        
+                        # Use the content as feedback
+                        return {
+                            "score": score,
+                            "feedback": content.strip()
+                        }
+                else:
+                    print("No JSON pattern found in response")
+                    # Fallback
+                    return {
+                        "score": 50,
+                        "feedback": content.strip() if content else "Could not parse evaluation. The answer appears to be of average quality."
+                    }
+        else:
+            print(f"Error evaluating answer: {response.status_code}, {response.text}")
+            return generate_fallback_evaluation(question, answer)
+    except Exception as e:
+        print(f"Error evaluating answer: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return generate_fallback_evaluation(question, answer)
+
+def generate_fallback_evaluation(question, answer):
+    """Generate a fallback evaluation when the API call fails"""
+    
+    # Simple keyword-based scoring
+    score = 50  # Default average score
+    
+    # Check if answer is empty or very short
+    if not answer or len(answer.split()) < 5:
+        return {
+            "score": 20,
+            "feedback": "Your answer was too brief. Please provide more detailed responses to demonstrate your knowledge."
+        }
+    
+    # Check for keywords from the expected answer
+    expected_keywords = []
+    if isinstance(question, dict) and 'expected_answer' in question:
+        expected_answer = question['expected_answer'].lower()
+        # Extract potential keywords (words longer than 4 characters)
+        expected_keywords = [word for word in expected_answer.split() if len(word) > 4]
+    
+    # Count matching keywords
+    keyword_matches = 0
+    answer_lower = answer.lower()
+    for keyword in expected_keywords:
+        if keyword in answer_lower:
+            keyword_matches += 1
+    
+    # Adjust score based on keyword matches
+    if expected_keywords:
+        keyword_score = min(70, (keyword_matches / len(expected_keywords)) * 100)
+        score = (score + keyword_score) / 2
+    
+    # Adjust score based on answer length (up to a point)
+    word_count = len(answer.split())
+    if word_count < 20:
+        score = max(20, score - 20)  # Penalize very short answers
+    elif word_count > 50:
+        score = min(90, score + 10)  # Reward substantial answers, but cap at 90
+    
+    # Generate feedback based on score
+    if score >= 80:
+        feedback = "Excellent answer! You demonstrated good understanding of the topic and provided a clear explanation."
+    elif score >= 60:
+        feedback = "Good answer. You covered some key points, but there's room to expand on certain aspects."
+    elif score >= 40:
+        feedback = "Average answer. You touched on the topic, but could provide more depth and technical details."
+    else:
+        feedback = "Your answer needs improvement. Try to be more specific and demonstrate your technical knowledge."
+    
+    return {
+        "score": round(score),
+        "feedback": feedback
+    }
 
 @app.post("/analyze", response_model=ATSResponse)
 async def analyze_resume(
+    request: Request,
     resume: UploadFile = File(...),
     job_description: str = Form(...)
 ):
@@ -292,9 +684,6 @@ async def analyze_resume(
     section_completeness = analyze_section_completeness(resume_text)
     specificity_score = analyze_specificity(resume_text, job_description)
     readability_complexity = analyze_readability_complexity(resume_text)
-    
-    logger.debug(f"Specificity Score: {specificity_score}")
-    logger.debug(f"Readability Complexity: {readability_complexity}")
     
     ats_score = round((
         keyword_match_rate * 0.20 +
@@ -340,6 +729,29 @@ async def analyze_resume(
     }
     suggestions = generate_suggestions(resume_text, job_description, metrics)
 
+    # Generate personalized interview questions
+    questions = generate_interview_questions(resume_text, job_description)
+
+    # Store in session
+    # request.session["resume_text"] = resume_text
+    # request.session["questions"] = questions
+    # request.session["current_question"] = 0
+    # request.session["results"] = []
+    # Generate a unique session ID if not exists
+    session_id = request.session.get("session_id")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        request.session["session_id"] = session_id
+    
+    # Store data in server-side cache
+    SESSION_DATA[session_id] = {
+        "resume_text": resume_text,
+        "questions": questions,
+        "current_question": 0,
+        "results": [],
+        "timestamp": time.time()  # For cleanup later
+    }
+
     return ATSResponse(
         ats_score=ats_score,
         keyword_match_rate=keyword_match_rate,
@@ -355,8 +767,198 @@ async def analyze_resume(
         readability_complexity=readability_complexity,
         analysis=analysis,
         suggestions=suggestions,
-        keywords=keywords
+        keywords=keywords,
+        resume_text=resume_text,
     )
+@app.post("/interview")
+async def interview(request: Request):
+    session_id = request.session.get("session_id")
+    if not session_id or session_id not in SESSION_DATA:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No resume uploaded. Please start over."}
+        )
+    
+    session_data = SESSION_DATA[session_id]
+    questions = session_data.get('questions')
+    current_question_index = session_data.get('current_question', 0)
+    
+    logger.debug(f"Questions type: {type(questions)}")
+    logger.debug(f"Questions data: {questions}")
+    logger.debug(f"Current question index: {current_question_index}")
+    
+    if isinstance(questions, list):
+        if current_question_index >= len(questions):
+            return {
+                "completed": True,
+                "scores": request.session.get('results', []),
+                "total_score": request.session.get('total_score', 0)
+            }
+        
+        return {
+            "questions": questions,
+            "question_number": current_question_index + 1,
+            "total_questions": len(questions)
+        }
+    elif isinstance(questions, str):
+        try:
+            parsed_questions = json.loads(questions)
+            if isinstance(parsed_questions, list) and len(parsed_questions) > 0:
+                request.session['questions'] = parsed_questions
+                return {
+                    "questions": parsed_questions,
+                    "question_number": current_question_index + 1,
+                    "total_questions": len(parsed_questions)
+                }
+        except:
+            pass
+    
+    return {"questions": questions}
+
+@app.post("/submit_answer")
+async def submit_answer(
+    data: AnswerSubmission,
+    request: Request
+):
+    try:
+        session_id = request.session.get("session_id")
+        # Check if session has questions
+        if not session_id or session_id not in SESSION_DATA:
+            raise HTTPException(status_code=400, detail="No interview in progress")
+        
+        logger.debug(f"Received answer submission data: {str(data)[:200]}...")
+        
+        # Process answer
+        answer = data.transcription if data.audio else data.answer
+        
+        # Cheating detection is disabled
+        cheating_detected = False
+        cheating_reason = ""
+        
+        # Get question data
+        session_data = SESSION_DATA[session_id]
+        questions = session_data.get('questions')
+        current_question_index = session_data.get('current_question', 0)
+        
+        # Ensure questions is a list
+        if isinstance(questions, str):
+            try:
+                questions = json.loads(questions)
+                request.session['questions'] = questions
+            except Exception as e:
+                logger.error(f"Failed to parse questions: {e}")
+                questions = [{"question": questions, "type": "general", "difficulty": "medium"}]
+                request.session['questions'] = questions
+        
+        if not isinstance(questions, list):
+            questions = [questions] if questions else [{"question": "General question", "type": "general", "difficulty": "medium"}]
+            request.session['questions'] = questions
+            
+        # Get current question
+        if current_question_index < len(questions):
+            current_question = questions[current_question_index]
+        else:
+            current_question = data.question if data.question else {"question": "General question", "type": "general", "difficulty": "medium"}
+        
+        # Make sure evaluate_answer is async-compatible
+        # If it's not, use run_in_threadpool
+        from starlette.concurrency import run_in_threadpool
+        
+        # Check if evaluate_answer is async
+        if not hasattr(evaluate_answer, "__await__"):
+            evaluation = await run_in_threadpool(
+                evaluate_answer,
+                current_question,
+                request.session.get('resume_text', ''),
+                answer
+            )
+        else:
+            evaluation = await evaluate_answer(
+                current_question,
+                request.session.get('resume_text', ''),
+                answer
+            )
+        
+        # Ensure evaluation format
+        if isinstance(evaluation, str):
+            try:
+                evaluation = json.loads(evaluation)
+            except:
+                evaluation = {"score": 50, "feedback": evaluation}
+        
+        if not isinstance(evaluation, dict):
+            evaluation = {"score": 50, "feedback": str(evaluation)}
+        
+        evaluation.setdefault("score", 50)
+        evaluation.setdefault("feedback", "No feedback provided")
+        
+        try:
+            evaluation["score"] = int(float(evaluation["score"]))
+        except (ValueError, TypeError):
+            evaluation["score"] = 50
+        
+        # Store result
+        result_entry = {
+            "question": current_question.get('question') if isinstance(current_question, dict) else str(current_question),
+            "answer": answer,
+            "score": evaluation["score"],
+            "feedback": evaluation["feedback"]
+        }
+        
+        results = request.session.get('results', [])
+        results.append(result_entry)
+        request.session['results'] = results
+        
+        total_score = sum(item["score"] for item in results) / len(results)
+        request.session['total_score'] = total_score
+        
+        # Next question
+        request.session['current_question'] = current_question_index + 1
+        is_completed = request.session['current_question'] >= len(questions)
+        
+        response_data = {
+            "success": True,
+            "evaluation": evaluation,
+        }
+        
+        if is_completed:
+            response_data.update({
+                "message": "Interview completed",
+                "redirect": "/results"
+            })
+        else:
+            response_data["next_question"] = request.session['current_question'] + 1
+            
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Error processing answer: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "success": True,
+            "evaluation": {
+                "score": 50,
+                "feedback": "Error occurred, but answer recorded"
+            }
+        }
+
+@app.get("/results")
+async def results(request: Request):
+    session_id = request.session.get("session_id")
+        # Check if session has questions
+    if not session_id or session_id not in SESSION_DATA:
+        raise HTTPException(status_code=400, detail="No interview results found")
+    
+    results = request.session['results']
+    total_score = sum(item.get('score', 0) for item in results) / len(results) if results else 0
+    
+    return {
+        "scores": results,
+        "total_score": total_score
+    }
+
 
 @app.get("/health")
 def health():
@@ -365,3 +967,5 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="localhost", port=8000)
+
+
