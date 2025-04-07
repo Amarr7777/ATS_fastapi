@@ -905,30 +905,34 @@ async def submit_answer(
             "feedback": evaluation["feedback"]
         }
         
-        results = request.session.get('results', [])
-        results.append(result_entry)
-        request.session['results'] = results
+        # results = request.session.get('results', [])
+        # results.append(result_entry)
+        # request.session['results'] = results
+        session_data["results"] = session_data.get("results", []) + [result_entry]
+        session_data["current_question"] = current_question_index + 1
+        SESSION_DATA[session_id] = session_data
         
-        total_score = sum(item["score"] for item in results) / len(results)
-        request.session['total_score'] = total_score
+        is_completed = session_data["current_question"] >= len(questions)
+        total_score = sum(item["score"] for item in session_data["results"]) / len(session_data["results"]) if session_data["results"] else 0
         
         # Next question
         request.session['current_question'] = current_question_index + 1
         is_completed = request.session['current_question'] >= len(questions)
         
         response_data = {
-            "success": True,
-            "evaluation": evaluation,
+        "success": True,
+        "evaluation": evaluation,
         }
-        
+    
         if is_completed:
             response_data.update({
-                "message": "Interview completed",
-                "redirect": "/results"
+            "message": "Interview completed",
+            "redirect": "/results",
+            "total_score": total_score
             })
         else:
-            response_data["next_question"] = request.session['current_question'] + 1
-            
+            response_data["next_question"] = session_data["current_question"] + 1
+    
         return response_data
         
     except Exception as e:
@@ -951,8 +955,9 @@ async def results(request: Request):
     if not session_id or session_id not in SESSION_DATA:
         raise HTTPException(status_code=400, detail="No interview results found")
     
-    results = request.session['results']
-    total_score = sum(item.get('score', 0) for item in results) / len(results) if results else 0
+    session_data = SESSION_DATA[session_id]
+    results = session_data.get("results", [])
+    total_score = sum(item["score"] for item in results) / len(results) if results else 0
     
     return {
         "scores": results,
